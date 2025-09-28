@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>SurgiVision — Live Instrument Detection</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+     
+      <h1>SurgiVision</h1>
+    </div>
+    <div class="status">
+      <span id="gpuBadge" class="badge">GPU: Auto</span>
+      <span id="sizeBadge" class="badge">Size: 640</span>
+      <span id="confBadge" class="badge">Conf ≥ 0.25</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Live Camera</h2>
+      <video id="video" autoplay playsinline></video>
+      <div class="controls">
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" class="ghost">Stop</button>
+        <div class="spacer"></div>
+        <label>Resolution</label>
+        <select id="resSel">
+          <option value="640x480" selected>640×480</option>
+          <option value="1280x720">1280×720</option>
+        </select>
+      </div>
+      <p class="hint">Allow the browser to access the camera when prompted.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Detections</h2>
+      <img id="inferred" alt="Detections frame"/>
+      <div class="stats">
+        <div>FPS: <span id="fps">0</span></div>
+        <div>Latency: <span id="lat">0</span> ms</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Automation</h2>
+      <div class="controls">
+        <label>Target class</label>
+        <select id="targetClass">
+          <option value="">Any</option>
+          <option value="curved_mayo_scissor">curved_mayo_scissor</option>
+          <option value="scalpel_no4">scalpel_no4</option>
+          <option value="straight_dissection_clamp">straight_dissection_clamp</option>
+          <option value="straight_mayo_scissor">straight_mayo_scissor</option>
+        </select>
+
+        <label>Conf ≥</label>
+        <input id="confMin" type="number" min="0" max="1" step="0.01" value="0.25" style="width:80px" />
+
+        <button id="saveBtn" class="ghost">Save frame & log</button>
+      </div>
+
+      <div class="controls">
+        <label>ROI (x,y,w,h %)</label>
+        <input id="roiX" type="number" value="25" style="width:70px" />
+        <input id="roiY" type="number" value="25" style="width:70px" />
+        <input id="roiW" type="number" value="50" style="width:70px" />
+        <input id="roiH" type="number" value="50" style="width:70px" />
+        <button id="toggleRoi" class="ghost">Toggle ROI</button>
+      </div>
+
+      <div class="controls">
+        <label>Webhook URL</label>
+        <input id="webhook" type="text" placeholder="https://example.com/hook" style="flex:1" />
+        <button id="testHook" class="ghost">Test Hook</button>
+      </div>
+
+      <div class="controls">
+        <label>Auto‑Pick</label>
+        <select id="autoPick">
+          <option value="off">Off</option>
+          <option value="on">On</option>
+        </select>
+        <span class="hint">When On, a valid detection will command the Arduino to pick.</span>
+      </div>
+
+      <audio id="beep">
+        <source src="/static/beep.mp3" type="audio/mpeg" />
+      </audio>
+    </section>
+  </main>
+
+  <footer>
+    <small>© 2025 SurgiVision – YOLOv5 on PyTorch (Local GPU)</small>
+  </footer>
+
+  <script>
+    const video = document.getElementById('video');
+    const inferred = document.getElementById('inferred');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn  = document.getElementById('stopBtn');
+    const resSel   = document.getElementById('resSel');
+    const fpsEl    = document.getElementById('fps');
+    const latEl    = document.getElementById('lat');
+
+    const targetClass = document.getElementById('targetClass');
+    const confMin     = document.getElementById('confMin');
+    const saveBtn     = document.getElementById('saveBtn');
+
+    const roiX = document.getElementById('roiX');
+    const roiY = document.getElementById('roiY');
+    const roiW = document.getElementById('roiW');
+    const roiH = document.getElementById('roiH');
+    const toggleRoi = document.getElementById('toggleRoi');
+
+    const webhook = document.getElementById('webhook');
+    const testHook = document.getElementById('testHook');
+
+    const autoPick = document.getElementById('autoPick');
+
+    const beep = document.getElementById('beep');
+
+    let stream = null;
+    let running = false;
+    let canvas = document.createElement('canvas');
+    let frameCounter = 0, fpsTimer = performance.now();
+    let drawROI = false;
+    let lastDetections = [];
+
+    function getRes() {
+      const [w,h] = resSel.value.split('x').map(Number);
+      return { width: w, height: h };
+    }
+
+    async function startCamera() {
+      if (running) return;
+      const { width, height } = getRes();
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { width, height }, audio: false });
+        video.srcObject = stream;
+        running = true;
+        requestAnimationFrame(loop);
+      } catch (e) {
+        alert('Camera access error: ' + e);
+      }
+    }
+
+    function stopCamera() {
+      running = false;
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    }
+
+    function rectOverlap(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2) {
+      return Math.max(0, Math.min(ax2, bx2) - Math.max(ax1, bx1)) *
+             Math.max(0, Math.min(ay2, by2) - Math.max(ay1, by1)) > 0;
+    }
+
+    async function loop() {
+      if (!running) return;
+
+      canvas.width = video.videoWidth || 640;
+      canvas.height = video.videoHeight || 480;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      // ROI overlay
+      if (drawROI) {
+        const rx = (parseFloat(roiX.value) / 100) * canvas.width;
+        const ry = (parseFloat(roiY.value) / 100) * canvas.height;
+        const rw = (parseFloat(roiW.value) / 100) * canvas.width;
+        const rh = (parseFloat(roiH.value) / 100) * canvas.height;
+        ctx.strokeStyle = '#2dd4bf';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(rx, ry, rw, rh);
+      }
+
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+      if (blob) {
+        const form = new FormData();
+        form.append('file', blob, 'frame.jpg');
+
+        const tSend = performance.now();
+        const res = await fetch('/infer_frame', { method: 'POST', body: form });
+        const arrBuf = await res.arrayBuffer();
+        const detHeader = res.headers.get('X-Detections');
+        lastDetections = detHeader ? JSON.parse(detHeader) : [];
+
+        const tRecv = performance.now();
+        latEl.textContent = Math.round(tRecv - tSend);
+
+        const url = URL.createObjectURL(new Blob([arrBuf], { type: 'image/jpeg' }));
+        inferred.src = url;
+
+        // Post-processing: alerts, logging, webhook, autopick
+        const clsFilter = targetClass.value;
+        const cmin = parseFloat(confMin.value) || 0.25;
+        const now = new Date().toISOString();
+
+        const rx = (parseFloat(roiX.value) / 100) * canvas.width;
+        const ry = (parseFloat(roiY.value) / 100) * canvas.height;
+        const rw = (parseFloat(roiW.value) / 100) * canvas.width;
+        const rh = (parseFloat(roiH.value) / 100) * canvas.height;
+        const roiPx = [rx, ry, rx+rw, ry+rh];
+
+        for (const d of lastDetections) {
+          if ((clsFilter === '' || d.name === clsFilter) && d.conf >= cmin) {
+            let hitROI = true;
+            if (drawROI) {
+              hitROI = rectOverlap(d.x1, d.y1, d.x2, d.y2, roiPx[0], roiPx[1], roiPx[2], roiPx[3]);
+            }
+            if (hitROI) {
+              // Sound
+              beep.currentTime = 0; beep.play().catch(()=>{});
+
+              // CSV log in memory
+              appendCSV(`${now},${d.name},${d.conf.toFixed(3)},${Math.round(d.x1)},${Math.round(d.y1)},${Math.round(d.x2)},${Math.round(d.y2)}\n`);
+
+              // Webhook
+              if (webhook.value) {
+                fetch(webhook.value, {
+                  method: 'POST',
+                  headers: {'Content-Type':'application/json'},
+                  body: JSON.stringify({ ts: now, class: d.name, conf: d.conf, box: {x1:d.x1,y1:d.y1,x2:d.x2,y2:d.y2} })
+                }).catch(()=>{});
+              }
+
+              // Auto-pick: send to backend -> Arduino
+              if (autoPick.value === 'on') {
+                fetch('/grasp3dof', {
+                  method: 'POST',
+                  headers: {'Content-Type':'application/json'},
+                  body: JSON.stringify({
+                    class: d.name,
+                    conf: d.conf,
+                    center: [ (d.x1 + d.x2)/2, (d.y1 + d.y2)/2 ]
+                  })
+                }).catch(()=>{});
+              }
+            }
+          }
+        }
+      }
+
+      frameCounter++;
+      const now2 = performance.now();
+      if (now2 - fpsTimer >= 1000) {
+        fpsEl.textContent = frameCounter;
+        frameCounter = 0;
+        fpsTimer = now2;
+      }
+      requestAnimationFrame(loop);
+    }
+
+    // CSV log buffer
+    let csv = "timestamp,class,conf,x1,y1,x2,y2\n";
+    function appendCSV(line) { csv += line; }
+
+    // Save annotated frame and CSV
+    saveBtn.addEventListener('click', () => {
+      if (inferred.src) {
+        const a = document.createElement('a');
+        a.href = inferred.src;
+        a.download = `surgivision_frame_${Date.now()}.jpg`;
+        a.click();
+      }
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a2 = document.createElement('a');
+      a2.href = url;
+      a2.download = `surgivision_log_${Date.now()}.csv`;
+      a2.click();
+    });
+
+    toggleRoi.addEventListener('click', () => drawROI = !drawROI);
+
+    testHook.addEventListener('click', () => {
+      if (!webhook.value) return alert("Enter a webhook URL first.");
+      fetch(webhook.value, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ ping: true, ts: new Date().toISOString() })
+      }).then(()=>alert('Webhook test sent.')).catch(()=>alert('Webhook failed.'));
+    });
+
+    startBtn.addEventListener('click', startCamera);
+    stopBtn.addEventListener('click', stopCamera);
+    resSel.addEventListener('change', () => { if (running) { stopCamera(); startCamera(); }});
+
+  </script>
+</body>
+</html>

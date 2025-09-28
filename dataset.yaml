@@ -1,0 +1,6 @@
+train: ../dataset/Surgical-Dataset/Images/All
+val: ../dataset/Surgical-Dataset/Images/All
+test: ../dataset/Surgical-Dataset/Images/All
+
+nc: 4
+names: ['curved_mayo_scissor', 'scalpel_no4', 'straight_dissection_clamp', 'straight_mayo_scissor']
